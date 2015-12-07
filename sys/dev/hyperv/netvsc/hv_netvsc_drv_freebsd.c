@@ -139,14 +139,6 @@ __FBSDID("$FreeBSD$");
     CSUM_IP6_TSO|CSUM_IP6_ISCSI)
 
 /*
- * Data types
- */
-
-struct hv_netvsc_driver_context {
-	uint32_t		drv_inited;
-};
-
-/*
  * Be aware that this sleepable mutex will exhibit WITNESS errors when
  * certain TCP and ARP code paths are taken.  This appears to be a
  * well-known condition, as all other drivers checked use a sleeping
@@ -167,10 +159,6 @@ struct hv_netvsc_driver_context {
  */
 
 int hv_promisc_mode = 0;    /* normal mode by default */
-
-/* The one and only one */
-static struct hv_netvsc_driver_context g_netvsc_drv;
-
 
 /*
  * Forward declarations
@@ -238,37 +226,6 @@ static uint32_t get_transport_proto_type(struct mbuf *m_head)
 	return (ret_val);
 }
 
-/*
- * NetVsc driver initialization
- * Note:  Filter init is no longer required
- */
-static int
-netvsc_drv_init(void)
-{
-	return (0);
-}
-
-/*
- * NetVsc global initialization entry point
- */
-static void
-netvsc_init(void)
-{
-	if (bootverbose)
-		printf("Netvsc initializing... ");
-
-	/*
-	 * XXXKYS: cleanup initialization
-	 */
-	if (!cold && !g_netvsc_drv.drv_inited) {
-		g_netvsc_drv.drv_inited = 1;
-		netvsc_drv_init();
-		if (bootverbose)
-			printf("done!\n");
-	} else if (bootverbose)
-		printf("Already initialized!\n");
-}
-
 /* {F8615163-DF3E-46c5-913F-F2D2F965ED0E} */
 static const hv_guid g_net_vsc_device_type = {
 	.data = {0x63, 0x51, 0x61, 0xF8, 0x3E, 0xDF, 0xc5, 0x46,
@@ -312,7 +269,8 @@ netvsc_attach(device_t dev)
 	struct ifnet *ifp;
 	int ret;
 
-	netvsc_init();
+	if (bootverbose)
+		printf("netvsc_attach\n");
 
 	sc = device_get_softc(dev);
 	if (sc == NULL) {
@@ -1313,6 +1271,3 @@ static devclass_t netvsc_devclass;
 DRIVER_MODULE(hn, vmbus, netvsc_driver, netvsc_devclass, 0, 0);
 MODULE_VERSION(hn, 1);
 MODULE_DEPEND(hn, vmbus, 1, 1, 1);
-SYSINIT(netvsc_initx, SI_SUB_KTHREAD_IDLE, SI_ORDER_MIDDLE + 1, netvsc_init,
-     NULL);
-

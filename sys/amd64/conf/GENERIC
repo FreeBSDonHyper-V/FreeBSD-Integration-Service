@@ -343,6 +343,7 @@ device		virtio_scsi		# VirtIO SCSI device
 device		virtio_balloon		# VirtIO Memory Balloon device
 
 # HyperV drivers
+options         HYPERV                  # Hyper-V kernel infrastructure
 device		hyperv			# HyperV drivers 
 
 # Xen HVM Guest Optimizations

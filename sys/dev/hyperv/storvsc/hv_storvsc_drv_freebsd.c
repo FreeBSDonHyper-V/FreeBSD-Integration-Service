@@ -2091,7 +2091,7 @@ storvsc_io_done(struct hv_storvsc_request *reqp)
 			mtx_unlock(&sc->hs_lock);
 		    }
 		    if (vm_srb->srb_status == SRB_STATUS_SUCCESS &&
-			data_len > SHORT_INQUIRY_LENGTH) {
+			data_len >= SHORT_INQUIRY_LENGTH) {
 			char vendor[16];
 			cam_strvis(vendor, inq_data->vendor, sizeof(inq_data->vendor),
 				sizeof(vendor));

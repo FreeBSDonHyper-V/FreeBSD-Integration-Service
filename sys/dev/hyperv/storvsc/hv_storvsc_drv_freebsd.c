@@ -1963,6 +1963,17 @@ create_storvsc_request(union ccb *ccb, struct hv_storvsc_request *reqp)
 	return(0);
 }
 
+static uint32_t
+is_scsi_valid(const struct scsi_inquiry_data *inq_data)
+{
+	u_int8_t type;
+	type = SID_TYPE(inq_data);
+	if (type == T_NODEVICE)
+		return (0);
+	if (SID_QUAL(inq_data) == SID_QUAL_BAD_LU)
+		return (0);
+	return (1);
+}
 /**
  * @brief completion function before returning to CAM
  *
@@ -2035,83 +2046,103 @@ storvsc_io_done(struct hv_storvsc_request *reqp)
 	ccb->ccb_h.status &= ~CAM_STATUS_MASK;
 	if (vm_srb->scsi_status == SCSI_STATUS_OK) {
 		const struct scsi_generic *cmd;
-		/*
-		 * Check whether the data for INQUIRY cmd is valid or
-		 * not.  Windows 10 and Windows 2016 send all zero
-		 * inquiry data to VM even for unpopulated slots.
-		 */
 		cmd = (const struct scsi_generic *)
 		    ((ccb->ccb_h.flags & CAM_CDB_POINTER) ?
 		     csio->cdb_io.cdb_ptr : csio->cdb_io.cdb_bytes);
 		if (vm_srb->srb_status != SRB_STATUS_SUCCESS) {
-		    if (storvsc_get_storage_type(sc->hs_dev->device) ==
-			DRIVER_STORVSC) {
-			ccb->ccb_h.status |= CAM_SEL_TIMEOUT;
-		    } else {
-			ccb->ccb_h.status |= CAM_DEV_NOT_THERE;
-		    }
-		    /**
-		     * Handle error:
-		     * If there are errors, for example, invalid LUN,
-		     * host will inform VM through SRB flags.
-		     */
-		    mtx_lock(&sc->hs_lock);
-		    if (vm_srb->srb_status == SRB_STATUS_INVALID_LUN) {
-			xpt_print(ccb->ccb_h.path, 
-			   "invalid LUN %d for op %s\n", vm_srb->lun,
-				scsi_op_desc(cmd->opcode, NULL));
-		    } else {
-			xpt_print(ccb->ccb_h.path,
-			   "Unknown SRB flag: %d for op %s\n",
-				vm_srb->srb_status,
-				scsi_op_desc(cmd->opcode, NULL));
-		    }
-		    mtx_unlock(&sc->hs_lock);
-		} else {
-		    ccb->ccb_h.status |= CAM_REQ_CMP;
-		}
-		if (cmd->opcode == INQUIRY) {
-		    struct scsi_inquiry_data *inq_data =
-			(struct scsi_inquiry_data *)csio->data_ptr;
-		    uint8_t* resp_buf = (uint8_t*)csio->data_ptr;
-		    /* Get the buffer length reported by host */
-		    int resp_xfer_len = vm_srb->transfer_len;
-		    /* Get the available buffer length */
-		    int resp_buf_len = resp_xfer_len >= 5 ?
-					resp_buf[4] + 5 : 0;
-		    int data_len = (resp_buf_len < resp_xfer_len) ?
-					resp_buf_len : resp_xfer_len;
-		    if (bootverbose && data_len >= 5) {
-			mtx_lock(&sc->hs_lock);
-			xpt_print(ccb->ccb_h.path,
-			    "storvsc inquiry (%d)"
-			    " [%x %x %x %x %x ... ]\n",
-			    data_len, resp_buf[0], resp_buf[1], resp_buf[2],
-			    resp_buf[3], resp_buf[4]);
-			mtx_unlock(&sc->hs_lock);
-		    }
-		    if (vm_srb->srb_status == SRB_STATUS_SUCCESS &&
-			data_len >= SHORT_INQUIRY_LENGTH) {
-			char vendor[16];
-			cam_strvis(vendor, inq_data->vendor, sizeof(inq_data->vendor),
-				sizeof(vendor));
-			/**
-			 * XXX: upgrade SPC2 to SPC3 if host is WIN8 or WIN2012 R2
-			 * in order to support UNMAP feature
+			/*
+			 * If there are errors, for example, invalid LUN,
+			 * host will inform VM through SRB status.
 			 */
-			if (!strncmp(vendor, "Msft", 4) &&
-			    SID_ANSI_REV(inq_data) == SCSI_REV_SPC2 &&
-			    (vmstor_proto_version == VMSTOR_PROTOCOL_VERSION_WIN8_1 ||
-			    vmstor_proto_version == VMSTOR_PROTOCOL_VERSION_WIN8)) {
-			    inq_data->version = SCSI_REV_SPC3;
-			    if (bootverbose) {
-				mtx_lock(&sc->hs_lock);
-				xpt_print(ccb->ccb_h.path,
-					"storvsc upgrades SPC2 to SPC3\n");
-				mtx_unlock(&sc->hs_lock);
-			    }
+			if (bootverbose) {
+				if (vm_srb->srb_status == SRB_STATUS_INVALID_LUN) {
+					xpt_print(ccb->ccb_h.path,
+					    "invalid LUN %d for op: %s\n",
+					    vm_srb->lun,
+					    scsi_op_desc(cmd->opcode, NULL));
+				} else {
+					xpt_print(ccb->ccb_h.path,
+					    "Unknown SRB flag: %d for op: %s\n",
+					    vm_srb->srb_status,
+					    scsi_op_desc(cmd->opcode, NULL));
+				}
 			}
-		    }
+
+			/*
+			 * XXX For a selection timeout, all of the LUNs
+			 * on the target will be gone.  It works for SCSI
+			 * disks, but does not work for IDE disks.
+			 *
+			 * For CAM_DEV_NOT_THERE, CAM will only get
+			 * rid of the device(s) specified by the path.
+			 */
+			if (storvsc_get_storage_type(sc->hs_dev->device) ==
+			    DRIVER_STORVSC)
+				ccb->ccb_h.status |= CAM_SEL_TIMEOUT;
+			else
+				ccb->ccb_h.status |= CAM_DEV_NOT_THERE;
+		} else {
+			ccb->ccb_h.status |= CAM_REQ_CMP;
+		}
+
+		if (cmd->opcode == INQUIRY &&
+		    vm_srb->srb_status == SRB_STATUS_SUCCESS) {
+			int resp_xfer_len, resp_buf_len, data_len;
+			struct scsi_inquiry_data *inq_data =
+			    (struct scsi_inquiry_data *)csio->data_ptr;
+			/* Get the buffer length reported by host */
+			resp_xfer_len = vm_srb->transfer_len;
+			uint8_t *resp_buf = (uint8_t *)csio->data_ptr;
+
+			/* Get the available buffer length */
+			resp_buf_len = resp_xfer_len >= 5 ? resp_buf[4] + 5 : 0;
+			data_len = (resp_buf_len < resp_xfer_len) ?
+			    resp_buf_len : resp_xfer_len;
+			if (bootverbose && data_len >= 5) {
+				xpt_print(ccb->ccb_h.path, "storvsc inquiry "
+				    "(%d) [%x %x %x %x %x ... ]\n", data_len,
+				    resp_buf[0], resp_buf[1], resp_buf[2],
+				    resp_buf[3], resp_buf[4]);
+			}
+			/*
+			 * XXX: Manually fix the wrong response returned from WS2012
+			 */
+			if (!is_scsi_valid(inq_data) &&
+			    (vmstor_proto_version == VMSTOR_PROTOCOL_VERSION_WIN8_1 ||
+			    vmstor_proto_version == VMSTOR_PROTOCOL_VERSION_WIN8 ||
+			    vmstor_proto_version == VMSTOR_PROTOCOL_VERSION_WIN7)) {
+				if (data_len >= 4 &&
+				    (resp_buf[2] == 0 || resp_buf[3] == 0)) {
+					resp_buf[2] = 5; // verion=5 means SPC-3
+					resp_buf[3] = 2; // resp fmt must be 2
+					if (bootverbose)
+						xpt_print(ccb->ccb_h.path,
+						    "fix version and resp fmt for 0x%x\n",
+						    vmstor_proto_version);
+				}
+			} else if (data_len >= SHORT_INQUIRY_LENGTH) {
+				char vendor[16];
+
+				cam_strvis(vendor, inq_data->vendor,
+				    sizeof(inq_data->vendor), sizeof(vendor));
+				/*
+				 * XXX: Upgrade SPC2 to SPC3 if host is WIN8 or
+				 * WIN2012 R2 in order to support UNMAP feature.
+				 */
+				if (!strncmp(vendor, "Msft", 4) &&
+				    SID_ANSI_REV(inq_data) == SCSI_REV_SPC2 &&
+				    (vmstor_proto_version ==
+				     VMSTOR_PROTOCOL_VERSION_WIN8_1 ||
+				     vmstor_proto_version ==
+				     VMSTOR_PROTOCOL_VERSION_WIN8)) {
+					inq_data->version = SCSI_REV_SPC3;
+					if (bootverbose) {
+						xpt_print(ccb->ccb_h.path,
+						    "storvsc upgrades "
+						    "SPC2 to SPC3\n");
+					}
+				}
+			}
 		}
 	} else {
 		mtx_lock(&sc->hs_lock);
